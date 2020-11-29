@@ -1,8 +1,10 @@
-docker pull mysql
+#docker pull mysql
+#docker pull docker.elastic.co/elasticsearch/elasticsearch:7.10.0
 echo starting docker container
-#cont=$( docker run --rm -d -p 3306:3306 --name some-mysql -e MYSQL_ROOT_PASSWORD=my-secret-pw -d mysql:latest --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci )
+msq_cont=$( docker run --rm -d -p 3306:3306 --name some-mysql -e MYSQL_ROOT_PASSWORD=my-secret-pw -d mysql:latest --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci )
+es_cont=$( docker run --rm -d -p 9200:9200 -p 9300:9300 -e "discovery.type=single-node" docker.elastic.co/elasticsearch/elasticsearch:7.10.0 )
 echo running main.go
-DATABASE_USERNAME=root DATABASE_PASSWORD=my-secret-pw DATABASE=nifi go run main.go
+SQL_USERNAME=root SQL_PASSWORD=my-secret-pw SQL_DATABASE=nifi go run main.go
 
 #docker stop $cont
 
@@ -14,6 +16,7 @@ DATABASE_USERNAME=root DATABASE_PASSWORD=my-secret-pw DATABASE=nifi go run main.
 #docker exec -it some-mysql sh -c 'exec mysql -uroot -p"$MYSQL_ROOT_PASSWORD"'
 #CREATE TABLE MyGuests (
 #id INT(6) UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+#  dadadadd   DOUBLE 
 #firstname VARCHAR(30) NOT NULL,
 #lastname VARCHAR(30) NOT NULL,
 #email VARCHAR(50),
