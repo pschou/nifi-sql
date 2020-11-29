@@ -25,6 +25,7 @@ type db_sql struct {
 	DB          *sql.DB
 	Ok          bool
 	Tables_seen []string
+	Cols_seen   map[string][]string
 }
 
 var dbsql = []db_sql{}
@@ -34,6 +35,7 @@ type db_es struct {
 	Username string
 	Password string
 	DB       *elasticsearch.Client
+	Ok       bool
 }
 
 var dbes = []db_es{}
@@ -48,7 +50,10 @@ func main() {
 	sql_username := testAndSet("SQL_USERNAME", "admin")
 	sql_password := testAndSet("SQL_PASSWORD", "password")
 	tablekey = testAndSet("SQL_TABLEKEY", tablekey)
-	sql_hosts := strings.Split(testAndSet("DATABASE_HOSTS", "localhost:3306,localhost6:3306"), ",")
+	sql_hosts := strings.Split(testAndSet("SQL_HOSTS", "localhost:3306,localhost6:3306"), ",")
+	es_username := testAndSet("ES_USERNAME", "admin")
+	es_password := testAndSet("ES_PASSWORD", "password")
+	es_hosts := strings.Split(testAndSet("ES_HOSTS", "localhost:9200"), ",")
 
 	http.HandleFunc("/", post)
 
@@ -56,9 +61,18 @@ func main() {
 
 	// creation connection structs and fork off a routine to make this connection and keep things running
 	for i, h := range sql_hosts {
-		t := db_sql{Address: h, Database: sql_database, Username: sql_username, Password: sql_password, Ok: false}
-		dbsql = append(dbsql, t)
-		go DialSQL(i)
+		if len(h) > 2 {
+			t := db_sql{Address: h, Database: sql_database, Username: sql_username, Password: sql_password, Ok: false, Cols_seen: make(map[string][]string)}
+			dbsql = append(dbsql, t)
+			go DialSQL(i)
+		}
+	}
+	for i, h := range es_hosts {
+		if len(h) > 2 {
+			t := db_es{Address: h, Username: es_username, Password: es_password, Ok: false}
+			dbes = append(dbes, t)
+			go DialES(i)
+		}
 	}
 
 	fmt.Printf("Starting server for testing HTTP POST...\n")
@@ -67,15 +81,82 @@ func main() {
 	}
 }
 
+func DialES(i int) {
+	wait := 0
+	for {
+		if dbes[i].Ok == false && wait == 30 {
+			fmt.Println("Retrying shortly ", dbes[i].Address)
+		}
+		time.Sleep(time.Duration(wait) * time.Second)
+		wait = 20
+		if dbes[i].Ok == false {
+			fmt.Println("Dialing ES", dbes[i].Address)
+			hostport := strings.SplitN(dbes[i].Address, "/", 4)
+			if len(hostport) == 1 {
+				hostport = []string{"http:", "", dbes[i].Address, ""}
+				dbes[i].Address = "http://" + dbes[i].Address
+			}
+			for {
+				timeout := 3 * time.Second
+				conn, err := net.DialTimeout("tcp", hostport[2], timeout)
+				if err != nil {
+					fmt.Println("Connecting error:", hostport[2], err)
+				}
+				if conn != nil {
+					conn.Close()
+					break
+				}
+				fmt.Println("Waiting for", dbes[i].Address, "TCP port to allow connections")
+				time.Sleep(10 * time.Second)
+			}
+			// Declare an Elasticsearch configuration
+			cfg := elasticsearch.Config{
+				Addresses: []string{dbes[i].Address},
+				Username:  dbes[i].Username,
+				Password:  dbes[i].Password,
+			}
+
+			// Instantiate a new Elasticsearch client object instance
+			client, err := elasticsearch.NewClient(cfg)
+
+			if err != nil {
+				fmt.Println("Elasticsearch connection error:", err)
+				continue
+			}
+			info, err := client.Info()
+			if err != nil {
+				fmt.Println("Elasticsearch info error:", err)
+				continue
+			}
+			fmt.Println("  Connect Success", dbes[i].Address)
+			fmt.Println("Elasticsearch info:", info)
+			dbes[i].DB = client
+			dbes[i].Ok = true
+		} else {
+			_, err := dbes[i].DB.Info()
+			if err != nil {
+				if dbes[i].DB != nil {
+					//err = dbes[i].DB.Close()
+				}
+				dbes[i].Ok = false
+			}
+
+		}
+	}
+
+}
 func DialSQL(i int) {
 	wait := 0
 	for {
+		if dbsql[i].Ok == false && wait == 30 {
+			fmt.Println("Retrying shortly ", dbsql[i].Address)
+		}
 		time.Sleep(time.Duration(wait) * time.Second)
-		wait = 30
+		wait = 20
 		if dbsql[i].Ok == false {
-			fmt.Println("Dialing", dbsql[i].Address)
+			fmt.Println("Dialing SQL", dbsql[i].Address)
 			for {
-				timeout := time.Second
+				timeout := 3 * time.Second
 				conn, err := net.DialTimeout("tcp", dbsql[i].Address, timeout)
 				if err != nil {
 					fmt.Println("Connecting error:", err)
@@ -237,9 +318,9 @@ func post(w http.ResponseWriter, r *http.Request) {
 			//fmt.Fprintf(w, "  mytable = %v\n", mytable)
 			// perform a db.Query insert
 			//QueryStr := "INSERT INTO " + mytable + " (" + strings.Join(keys, ",") + ") VALUES (" + strings.Join(vals, ",") + ")"
-			QueryStr := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES (%s);", mytable, strings.Join(keys, ","), strings.Join(vals, ","))
 			//fmt.Fprintf(w, "  qry = %v\n", QueryStr)
 			for i, sqlh := range dbsql {
+				QueryStr := fmt.Sprintf("INSERT INTO `%s`.`%s` (%s) VALUES (%s);", sqlh.Database, mytable, strings.Join(keys, ","), strings.Join(vals, ","))
 				if sqlh.Ok == true {
 					seen := false
 					for _, t := range sqlh.Tables_seen {
@@ -250,34 +331,63 @@ func post(w http.ResponseWriter, r *http.Request) {
 					if seen == false {
 						var tbl string = ""
 						err := sqlh.DB.QueryRow(fmt.Sprintf("SHOW TABLES LIKE '%s';", mytable)).Scan(&tbl)
-						if err == nil {
-							if tbl == mytable {
-								log.Println("found table", mytable, "in database, don't need to create.")
-								dbsql[i].Tables_seen = append(dbsql[i].Tables_seen, mytable)
-							}
-						} else {
+						if err != nil {
 							//log.Println("error showing tables", err.Error())
 							//} else {
 							//if test_table.Next() {
 							//	tables_seen = append(tables_seen, mytable)
 							//} else {
-							create_str := fmt.Sprintf("CREATE TABLE `%s` (NiFi_TIMESTAMP TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, %s)", mytable, strings.Join(cols, ","))
+							create_str := fmt.Sprintf("CREATE TABLE `%s`.`%s` (NiFi_TIMESTAMP TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, %s)", sqlh.Database, mytable, strings.Join(cols, ","))
 							//log.Println("creating table", err)
 							create, err := sqlh.DB.Query(create_str)
 							if err != nil {
 								log.Println("error creating table", err, "qry =", create_str)
-							} else {
-								dbsql[i].Tables_seen = append(dbsql[i].Tables_seen, mytable)
-								create.Close()
+								continue
 							}
-							//}
+							dbsql[i].Cols_seen[mytable] = cols
+							dbsql[i].Tables_seen = append(dbsql[i].Tables_seen, mytable)
+							create.Close()
+						} else {
+							if tbl == mytable {
+								log.Println("found table", mytable, "in database, don't need to create.")
+								getcols_str := fmt.Sprintf("SHOW COLUMNS FROM `%s`.`%s`;", sqlh.Database, mytable)
+								getcols, err := sqlh.DB.Query(getcols_str)
+								if err != nil {
+									log.Println("error getting columns from table", err, "qry =", getcols_str)
+									continue
+								}
+								defer getcols.Close()
+
+								gcols := []string{}
+								for getcols.Next() {
+									var (
+										Field   string
+										Type    interface{}
+										Null    interface{}
+										Key     string
+										Default interface{}
+										Extra   string
+									)
+									if err := getcols.Scan(&Field, &Type, &Null, &Key, &Default, &Extra); err != nil {
+										log.Println("error scanning cols", err)
+										break
+									}
+									gcols = append(gcols, Field)
+								}
+								dbsql[i].Cols_seen[mytable] = gcols
+								dbsql[i].Tables_seen = append(dbsql[i].Tables_seen, mytable)
+							} else {
+								log.Println("Show tables passed, but the table name did not match... WHAT?  I'll try ignoring.", tbl, mytable)
+							}
 						}
+
 					}
 
 					insert, err := sqlh.DB.Query(QueryStr)
 					// if there is an error inserting, handle it
 					if err != nil {
 						log.Println("error encountered ", err.Error())
+						log.Println("cols", dbsql[i].Cols_seen[mytable])
 						log.Println("  qry = ", QueryStr)
 						continue
 					}
