@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -9,12 +11,13 @@ import (
 	"net"
 	"net/http"
 	"os"
+	//"reflect"
 	"strings"
 	"time"
 
 	// Import the Elasticsearch library packages
 	"github.com/elastic/go-elasticsearch"
-	//"github.com/elastic/go-elasticsearch/esapi"
+	"github.com/elastic/go-elasticsearch/esapi"
 )
 
 type db_sql struct {
@@ -41,7 +44,7 @@ type db_es struct {
 var dbes = []db_es{}
 
 var tablekey = "type"
-var hosts = []string{}
+var ctx context.Context
 
 func main() {
 	fmt.Println("Loading settings from environment")
@@ -67,6 +70,7 @@ func main() {
 			go DialSQL(i)
 		}
 	}
+	ctx = context.Background()
 	for i, h := range es_hosts {
 		if len(h) > 2 {
 			t := db_es{Address: h, Username: es_username, Password: es_password, Ok: false}
@@ -128,8 +132,8 @@ func DialES(i int) {
 				fmt.Println("Elasticsearch info error:", err)
 				continue
 			}
-			fmt.Println("  Connect Success", dbes[i].Address)
 			fmt.Println("Elasticsearch info:", info)
+			fmt.Println("  Connect Success", dbes[i].Address)
 			dbes[i].DB = client
 			dbes[i].Ok = true
 		} else {
@@ -199,19 +203,25 @@ func DialSQL(i int) {
 			//defer db.Close()
 
 			// perform a test query
-			var val int
-			err = db.QueryRow("SELECT 42 as test;").Scan(&val)
-			//fmt.Printf("test = %v\n", val)
+			version_ck, err := db.Query("SHOW VARIABLES LIKE '%%version%%';")
 			if err != nil {
 				fmt.Println("  Failed SELECT test query", err)
 				db.Close()
 				continue
 			}
+			defer version_ck.Close()
 
-			if val != 42 {
-				fmt.Println("  SELECT query replied with invalid result")
-				db.Close()
-				continue
+			for version_ck.Next() {
+				var (
+					ver_var string
+					ver_val string
+				)
+				if err := version_ck.Scan(&ver_var, &ver_val); err != nil {
+					log.Println("  Failed collecting version information", dbsql[i].Address)
+					continue
+				}
+
+				fmt.Println("  ", dbsql[i].Address, ver_var, ver_val)
 			}
 
 			fmt.Println("  Connect Success", dbsql[i].Address)
@@ -267,10 +277,9 @@ func post(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		var X map[string]interface{}
-
 		//fmt.Fprintf(w, "Post from website! r.PostFrom = %v\n", r.PostForm)
 		for dat := range r.PostForm {
+			X := make(map[string]interface{})
 			//fmt.Fprintf(w, "  dat = %v\n", dat)
 			if err := json.Unmarshal([]byte(dat), &X); err != nil {
 				log.Printf("  err parsing dat= %v, %v\n", dat, err)
@@ -278,40 +287,77 @@ func post(w http.ResponseWriter, r *http.Request) {
 			}
 			//fmt.Fprintf(w, "  dat = %v\n", X)
 
-			mytable := ""
-			var keys []string
-			var vals []string
-			var cols []string
+			// create hash for elasticsearch
+			h := sha256.New()
+			h.Write([]byte(dat))
+			docID := fmt.Sprintf("%x", h.Sum(nil))
 
+			mytable := ""
+			keys := []string{}
+			vals := []string{}
+			cols := []string{}
+
+			// parse the values for ease of building sql query
 			for key, val := range X {
 				if key == tablekey {
 					mytable = val.(string)
 					continue
 				}
 				//fmt.Fprintf(w, "  key = %v  val = %v\n", key, val)
-				keys = append(keys, fmt.Sprintf("`%s`", key))
 				switch v := val.(type) {
 				case float64:
+					keys = append(keys, fmt.Sprintf("`%s`", key))
 					vals = append(vals, fmt.Sprintf("%f", v))
 					cols = append(cols, fmt.Sprintf("`%s` DOUBLE", key))
 				case string:
 					if strings.HasSuffix(key, "Seconds") {
+						keys = append(keys, fmt.Sprintf("`%s`", key))
 						vals = append(vals, v)
 						cols = append(cols, fmt.Sprintf("`%s` DOUBLE", key))
 					} else if len(v) == 19 && v[4] == '-' && v[7] == '-' && v[10] == 'T' && v[13] == ':' && v[16] == ':' {
+						keys = append(keys, fmt.Sprintf("`%s`", key))
 						vals = append(vals, ("STR_TO_DATE(\"" + v + "\",\"%Y-%m-%dT%H:%i:%s\")"))
 						cols = append(cols, fmt.Sprintf("`%s` TIMESTAMP", key))
 					} else {
 						if len(v) < 15 {
+							keys = append(keys, fmt.Sprintf("`%s`", key))
 							vals = append(vals, fmt.Sprintf("\"%s\"", MysqlRealEscapeString(v)))
 							cols = append(cols, fmt.Sprintf("`%s` VARCHAR(30)", key))
 						} else {
+							keys = append(keys, fmt.Sprintf("`%s`", key))
 							vals = append(vals, fmt.Sprintf("\"%s\"", MysqlRealEscapeString(v)))
 							cols = append(cols, fmt.Sprintf("`%s` VARCHAR(%d)", key, len(v)*2))
 						}
 					}
 				default:
 					log.Printf("I don't know about type %T!\n", v)
+				}
+			}
+
+			//log.Println(" index is ", mytable)
+			//log.Println(" hash length is ", len(docID), docID)
+			//log.Println("  blob = ", string(blob))
+
+			for _, es_h := range dbes {
+				if es_h.Ok == true {
+					req := esapi.IndexRequest{
+						Index:      strings.ToLower(mytable),
+						Body:       strings.NewReader(string(dat)),
+						DocumentID: docID,
+						Refresh:    "true",
+					}
+					//fmt.Println(reflect.TypeOf(req))
+
+					res, err := req.Do(ctx, es_h.DB)
+					if err != nil {
+						log.Println("IndexRequest ERROR: %s", err)
+					}
+					//fmt.Println(res)
+					defer res.Body.Close()
+
+					if res.IsError() {
+						log.Printf("%s ERROR indexing document ", res.Status())
+					}
 				}
 			}
 
@@ -337,8 +383,8 @@ func post(w http.ResponseWriter, r *http.Request) {
 							//if test_table.Next() {
 							//	tables_seen = append(tables_seen, mytable)
 							//} else {
-							create_str := fmt.Sprintf("CREATE TABLE `%s`.`%s` (NiFi_TIMESTAMP TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, %s)", sqlh.Database, mytable, strings.Join(cols, ","))
-							//log.Println("creating table", err)
+							create_str := fmt.Sprintf("CREATE TABLE `%s`.`%s` (NiFi_TIMESTAMP TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, %s);", sqlh.Database, mytable, strings.Join(cols, ","))
+							log.Println(">", create_str)
 							create, err := sqlh.DB.Query(create_str)
 							if err != nil {
 								log.Println("error creating table", err, "qry =", create_str)
