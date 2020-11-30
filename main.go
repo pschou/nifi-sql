@@ -178,20 +178,17 @@ func DialSQL(i int) {
 				continue
 			}
 
-			// if database does not exist, attempt to create it
-			create, err := db.Query("CREATE DATABASE IF NOT EXISTS " + dbsql[i].Database + ";")
-			if err != nil {
-				fmt.Println("  Warning: CREATE command returned error", err)
-				db.Close()
-				continue
-			}
-			create.Close()
-
 			usedb, err := db.Query("USE " + dbsql[i].Database + ";")
 			if err != nil {
-				fmt.Println("  Warning: USE database command returned error", err)
-				db.Close()
-				continue
+				fmt.Println("  Warning: USE database command returned error, will try creating...", err)
+				// if database does not exist, attempt to create it
+				create, err := db.Query("CREATE DATABASE IF NOT EXISTS " + dbsql[i].Database + ";")
+				if err != nil {
+					fmt.Println("  Error: SQL command failed", err)
+					db.Close()
+					continue
+				}
+				create.Close()
 			}
 			usedb.Close()
 
